@@ -14,6 +14,8 @@ If the error comes back once the fix is deployed, Errilo reopens the issue as a 
 
 There is no code of ours to install: one workflow file that uses [`anthropics/claude-code-action`](https://github.com/anthropics/claude-code-action), maintained by Anthropic, and the [Errilo MCP server](https://app.errilo.com/mcp). Copy it, read it, change it.
 
+Step-by-step guide, with a sequence diagram of what Errilo, GitHub and Claude Code send each other: [Auto-fix with Claude Code and GitHub Actions](https://www.errilo.com/en/auto-fix/) ([en français](https://www.errilo.com/correction-automatique/)).
+
 ## Setup
 
 You need an Errilo project that receives errors from your app, admin access to the GitHub repository, and either an [Anthropic API key](https://console.anthropic.com/settings/keys) or a Claude subscription (Pro or Max).
