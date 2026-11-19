@@ -1,21 +1,5 @@
-# Errilo auto-fix
-#
-# When Errilo reports a new issue or a regression, Claude Code reads it through the Errilo MCP
-# server, reproduces it with a failing test, fixes it, and the workflow opens a pull request.
-# The issue is then marked "resolved in the next release" in Errilo.
-#
-# Copy this file to .github/workflows/errilo-auto-fix.yml on your default branch (GitHub only runs
-# repository_dispatch workflows from there). Setup, cost and safeguards: README.md.
-#
-# Required:
-#   secrets.ANTHROPIC_API_KEY or secrets.CLAUDE_CODE_OAUTH_TOKEN
-#                              Anthropic API key, or Claude subscription token (`claude setup-token`)
-#   secrets.ERRILO_TOKEN       Errilo token limited to one project, scopes issues:read and issues:write
-#   vars.ERRILO_ORG            Errilo organization slug (the first segment of your issue URLs)
-# Optional:
-#   secrets.ERRILO_AUTOFIX_GITHUB_TOKEN  token that opens the pull request, so that your CI runs on it
-#   vars.ERRILO_URL                      default https://app.errilo.com
-#   vars.ERRILO_MAX_PRS_PER_DAY          default 3
+# Errilo auto-fix: copy to .github/workflows/errilo-auto-fix.yml on your default branch.
+# Docs: https://github.com/geterrilo/autofix
 
 name: Errilo auto-fix
 
@@ -27,30 +11,16 @@ on:
       issue_id:
         description: Errilo issue id
         required: true
-        type: string
 
-# No permission by default: each job asks for what it needs.
 permissions: {}
 
-# One run at a time per issue: Errilo delivers alerts "at least once", so the same issue can arrive
-# twice. The second run waits for the first one, then sees its branch and stops.
+# Errilo delivers alerts "at least once": one run at a time per issue.
 concurrency:
   group: errilo-auto-fix-${{ github.event.client_payload.issue_id || inputs.issue_id }}
   cancel-in-progress: false
 
-env:
-  ERRILO_URL: ${{ vars.ERRILO_URL || 'https://app.errilo.com' }}
-  ERRILO_ORG: ${{ vars.ERRILO_ORG }}
-  MAX_PRS_PER_DAY: ${{ vars.ERRILO_MAX_PRS_PER_DAY || '3' }}
-
 jobs:
-  # Decides whether the issue should be fixed. No agent here, read-only GitHub token.
-  guard:
-    # Spike alerts are not fixed: a spike is a known issue occurring more often.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.client_payload.trigger == 'new_issue' ||
-      github.event.client_payload.trigger == 'regression'
+  check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -58,271 +28,73 @@ jobs:
       pull-requests: read
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
-      issue_id: ${{ steps.check.outputs.issue_id }}
+      issue-id: ${{ steps.check.outputs.issue-id }}
     steps:
       - id: check
-        env:
-          # client_payload comes from an HTTP call: it is data, read through environment variables
-          # only, never written into a script with ${{ }}.
-          RAW_ISSUE_ID: ${{ github.event.client_payload.issue_id || inputs.issue_id }}
-          IS_TEST: ${{ github.event.client_payload.test }}
-          ERRILO_TOKEN: ${{ secrets.ERRILO_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          skip() { echo "::notice::Skipped: $1"; echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0; }
-          fail() { echo "::error::$1"; exit 1; }
+        uses: geterrilo/autofix@v1
+        with:
+          step: check
+          errilo-token: ${{ secrets.ERRILO_TOKEN }}
+          errilo-org: ${{ vars.ERRILO_ORG }}
 
-          if [ "$IS_TEST" = "true" ]; then skip "test alert received, the dispatch reaches this workflow."; fi
-          [[ "$RAW_ISSUE_ID" =~ ^[1-9][0-9]{0,15}$ ]] || fail "issue_id must be a positive integer."
-          ISSUE_ID="$RAW_ISSUE_ID"
-          BRANCH="errilo/fix-$ISSUE_ID"
-
-          [ -n "$ERRILO_TOKEN" ] || fail "The ERRILO_TOKEN secret is missing."
-          [[ "$ERRILO_ORG" =~ ^[a-z0-9][a-z0-9-]*$ ]] || fail "The ERRILO_ORG variable is missing or is not an organization slug."
-          [[ "$ERRILO_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] || fail "ERRILO_URL must be an https origin, without a path."
-
-          # Deduplication: one branch per issue. It exists while its pull request is open, and after
-          # it if the branch was not deleted.
-          refs=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$BRANCH" \
-            --jq "[.[] | select(.ref == \"refs/heads/$BRANCH\")] | length")
-          [ "$refs" = "0" ] || skip "branch $BRANCH already exists (pull request open, or branch not deleted after merge)."
-
-          # Daily cap on the pull requests opened by this workflow.
-          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          opened=$(gh api "repos/$GH_REPO/pulls?state=all&sort=created&direction=desc&per_page=100" \
-            --jq "[.[] | select((.head.ref | startswith(\"errilo/fix-\")) and .created_at >= \"$since\")] | length")
-          [ "$opened" -lt "$MAX_PRS_PER_DAY" ] || skip "$opened auto-fix pull requests in the last 24 hours (cap: $MAX_PRS_PER_DAY)."
-
-          # The issue, read with the project token: a 404 also covers an issue of another project.
-          status=$(curl -sS -o issue.json -w '%{http_code}' \
-            -H "Authorization: Bearer $ERRILO_TOKEN" -H 'Accept: application/json' \
-            "$ERRILO_URL/api/v1/organizations/$ERRILO_ORG/issues/$ISSUE_ID")
-          case "$status" in
-            200) ;;
-            404) skip "issue $ISSUE_ID not found in the project of ERRILO_TOKEN." ;;
-            401|403) fail "Errilo refused ERRILO_TOKEN (HTTP $status)." ;;
-            *) fail "Errilo answered HTTP $status." ;;
-          esac
-          issue_status=$(jq -r '.issue.status' issue.json)
-          [ "$issue_status" = "unresolved" ] || skip "issue $ISSUE_ID is $issue_status."
-
-          # Only dependency frames (node_modules, Node.js internals): nothing to fix in this repository.
-          # Same classification as the Errilo stack trace.
-          frames=$(jq -r '
-            [(.latestEvent.exception // [])[].frames[]] as $frames
-            | if ($frames | length) == 0 then "none"
-              elif any($frames[];
-                ((.filename // .absPath // "") as $path
-                 | ($path | test("(^|/)node_modules/") | not)
-                   and ($path | test("^(node:|internal/)") | not)
-                   and .inApp != false))
-              then "app" else "dependencies" end' issue.json)
-          [ "$frames" != "dependencies" ] || skip "the stack trace only has dependency frames."
-
-          echo "issue_id=$ISSUE_ID" >> "$GITHUB_OUTPUT"
-          echo "proceed=true" >> "$GITHUB_OUTPUT"
-
-  # The agent works with a read-only GitHub token: it can neither push nor open a pull request.
-  # It commits locally, and the workflow exports its commits as a patch.
   fix:
-    needs: guard
-    if: needs.guard.outputs.proceed == 'true'
+    needs: check
+    if: needs.check.outputs.proceed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
-      contents: read
+      contents: read # the agent can neither push nor open a pull request
     outputs:
-      has_fix: ${{ steps.export.outputs.has_fix }}
-    env:
-      ISSUE_ID: ${{ needs.guard.outputs.issue_id }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      has-fix: ${{ steps.export.outputs.has-fix }}
     steps:
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 0 # the agent checks out the commit of the release
+          fetch-depth: 0
           persist-credentials: false
 
-      # Add your project's setup here, so that the agent can run the tests. For example:
-      # - uses: actions/setup-node@v6
-      #   with:
-      #     node-version: 24
-      # - run: npm ci
+      # Your project's setup, so that the agent can run the tests.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: npm ci
 
-      - name: Configure the agent
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/errilo"
-          # The token is not written here: Claude Code reads ${ERRILO_TOKEN} from the environment.
-          jq -n --arg url "$ERRILO_URL/mcp" \
-            '{mcpServers: {errilo: {type: "http", url: $url, headers: {Authorization: "Bearer ${ERRILO_TOKEN}"}}}}' \
-            > "$RUNNER_TEMP/errilo/mcp.json"
-          cat > "$RUNNER_TEMP/errilo/ci.md" <<EOF
-          You run in a GitHub Actions workflow, without anyone to answer questions. Steps 5 to 7 of
-          the fix_issue method change here, because the workflow opens the pull request itself:
-
-          - Do not push, do not open a pull request, do not call add_comment or update_issue.
-          - Commit the fix (the test and the code change) on a local branch named
-            errilo/fix-$ISSUE_ID, created from origin/$DEFAULT_BRANCH without tracking
-            (git switch --no-track -c errilo/fix-$ISSUE_ID origin/$DEFAULT_BRANCH). If you worked from the release
-            commit, apply the fix on top of origin/$DEFAULT_BRANCH and check that the test still passes.
-          - Do not change files under .github/.
-          - Write the pull request description, in Markdown, to $RUNNER_TEMP/errilo/summary.md: the
-            diagnosis, the fix and the test you added, in a few lines. The workflow copies it into the
-            pull request and into an Errilo comment.
-          - If you cannot reproduce or fix the error, or the fix is uncertain, do not create the
-            branch: write the reason to $RUNNER_TEMP/errilo/summary.md and stop.
-          EOF
+      - id: errilo
+        uses: geterrilo/autofix@v1
+        with:
+          step: prepare
+          issue-id: ${{ needs.check.outputs.issue-id }}
 
       - uses: anthropics/claude-code-action@v1
         env:
           ERRILO_TOKEN: ${{ secrets.ERRILO_TOKEN }}
         with:
-          # One of the two: an API key, or a Claude subscription token.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
-          # The fix_issue prompt of the Errilo MCP server: read, check out the release commit,
-          # reproduce with a failing test, fix. issue_id was validated by the guard job (digits only).
-          prompt: /mcp__errilo__fix_issue ${{ needs.guard.outputs.issue_id }}
+          prompt: ${{ steps.errilo.outputs.prompt }}
           claude_args: |
-            --mcp-config ${{ runner.temp }}/errilo/mcp.json
-            --append-system-prompt-file ${{ runner.temp }}/errilo/ci.md
-            --add-dir ${{ runner.temp }}/errilo
-            --allowedTools mcp__errilo__get_issue,mcp__errilo__get_event,mcp__errilo__get_tag_distribution,mcp__errilo__get_release,mcp__errilo__search_issues,mcp__errilo__list_projects
-            --disallowedTools mcp__errilo__update_issue,mcp__errilo__add_comment
+            ${{ steps.errilo.outputs.claude-args }}
             --max-turns 80
 
       - id: export
-        run: |
-          set -euo pipefail
-          BRANCH="errilo/fix-$ISSUE_ID"
-          BASE="origin/$DEFAULT_BRANCH"
-          mkdir -p patch
-          if [ -s "$RUNNER_TEMP/errilo/summary.md" ]; then
-            cp "$RUNNER_TEMP/errilo/summary.md" patch/summary.md
-          fi
-          if ! git rev-parse --verify --quiet "refs/heads/$BRANCH" > /dev/null \
-            || [ "$(git rev-list --count "$BASE..$BRANCH")" = "0" ]; then
-            echo "::notice::No fix for issue $ISSUE_ID. The agent's reason is in the job summary."
-            { echo "## No fix for Errilo issue $ISSUE_ID"; echo; cat patch/summary.md 2> /dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
-            echo "has_fix=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git merge-base --is-ancestor "$BASE" "$BRANCH" \
-            || { echo "::error::$BRANCH is not based on $BASE."; exit 1; }
-          if git diff --name-only "$BASE...$BRANCH" | grep -q '^\.github/'; then
-            echo "::error::The fix changes files under .github/: refused."
-            exit 1
-          fi
-          git format-patch --binary --output-directory patch "$BASE..$BRANCH"
-          echo "has_fix=true" >> "$GITHUB_OUTPUT"
-
-      - if: steps.export.outputs.has_fix == 'true'
-        uses: actions/upload-artifact@v7
+        uses: geterrilo/autofix@v1
         with:
-          name: errilo-fix
-          path: patch/
-          retention-days: 7
+          step: export
+          issue-id: ${{ needs.check.outputs.issue-id }}
 
-  # No agent here. Pushes the agent's commits to errilo/fix-<issue_id>, never to the default
-  # branch, opens the pull request and updates the Errilo issue.
   pull-request:
-    needs: [guard, fix]
-    if: needs.fix.outputs.has_fix == 'true'
+    needs: [check, fix]
+    if: needs.fix.outputs.has-fix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
       pull-requests: write
-    env:
-      ISSUE_ID: ${{ needs.guard.outputs.issue_id }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: geterrilo/autofix@v1
         with:
-          ref: ${{ github.event.repository.default_branch }}
-          token: ${{ secrets.ERRILO_AUTOFIX_GITHUB_TOKEN || github.token }}
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: errilo-fix
-          path: ${{ runner.temp }}/patch
-
-      - name: Push the branch and open the pull request
-        id: pr
-        env:
-          GH_TOKEN: ${{ secrets.ERRILO_AUTOFIX_GITHUB_TOKEN || github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          [[ "$ISSUE_ID" =~ ^[1-9][0-9]{0,15}$ ]] || { echo "::error::Invalid issue_id."; exit 1; }
-          BRANCH="errilo/fix-$ISSUE_ID"
-          [ "$BRANCH" != "$DEFAULT_BRANCH" ] || { echo "::error::Refusing to push to the default branch."; exit 1; }
-
-          # The cap again, just before opening: runs for different issues work in parallel.
-          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
-          opened=$(gh api "repos/$GH_REPO/pulls?state=all&sort=created&direction=desc&per_page=100" \
-            --jq "[.[] | select((.head.ref | startswith(\"errilo/fix-\")) and .created_at >= \"$since\")] | length")
-          if [ "$opened" -ge "$MAX_PRS_PER_DAY" ]; then
-            echo "::warning::Daily cap reached ($MAX_PRS_PER_DAY): the fix stays in the errilo-fix artifact of this run."
-            exit 0
-          fi
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git switch --create "$BRANCH"
-          git am --3way "$RUNNER_TEMP"/patch/*.patch
-          # Without --force: if the branch appeared meanwhile, the push fails instead of replacing it.
-          git push origin "refs/heads/$BRANCH:refs/heads/$BRANCH"
-
-          link="$ERRILO_URL/$ERRILO_ORG/issues/$ISSUE_ID"
-          {
-            if [ -s "$RUNNER_TEMP/patch/summary.md" ]; then cat "$RUNNER_TEMP/patch/summary.md"; echo; fi
-            echo "---"
-            echo "Opened by the [Errilo auto-fix workflow]($GITHUB_SERVER_URL/$GH_REPO/actions/runs/$GITHUB_RUN_ID) for [Errilo issue $ISSUE_ID]($link). Review it like any other change."
-          } > "$RUNNER_TEMP/body.md"
-          if ! url=$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" \
-            --title "fix: Errilo issue $ISSUE_ID" --body-file "$RUNNER_TEMP/body.md"); then
-            # Remove the branch pushed above, otherwise the next run for this issue would skip it.
-            git push origin --delete "$BRANCH" || true
-            echo "::error::Could not open the pull request. If GitHub Actions may not create pull requests, see \"Pull request token\" in the README. The fix is in the errilo-fix artifact of this run."
-            exit 1
-          fi
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "Pull request: $url" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Comment and resolve the Errilo issue
-        if: steps.pr.outputs.url != ''
-        env:
-          ERRILO_TOKEN: ${{ secrets.ERRILO_TOKEN }}
-          PR_URL: ${{ steps.pr.outputs.url }}
-        run: |
-          set -euo pipefail
-          # One MCP tools/call (protocol 2026-07-28, stateless). Arguments are built by jq, never by
-          # string concatenation.
-          call() {
-            jq -n --arg name "$1" --argjson args "$2" '{
-              jsonrpc: "2.0", id: 1, method: "tools/call",
-              params: {name: $name, arguments: $args, _meta: {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientInfo": {name: "errilo-auto-fix", version: "1.0.0"},
-                "io.modelcontextprotocol/clientCapabilities": {}}}}' > request.json
-            curl -sS -X POST "$ERRILO_URL/mcp" \
-              -H "Authorization: Bearer $ERRILO_TOKEN" \
-              -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-              -H 'MCP-Protocol-Version: 2026-07-28' -H 'Mcp-Method: tools/call' -H "Mcp-Name: $1" \
-              --data @request.json > response.json
-            if jq -e '.result != null and .result.isError != true' response.json > /dev/null; then return 0; fi
-            echo "::warning::$1: $(jq -r '[.result.content[]?.text, (.error | objects | .message), (.error | strings), .error_description] | map(select(. != null)) | join(" ")' response.json)"
-            return 1
-          }
-
-          summary=""
-          [ -s "$RUNNER_TEMP/patch/summary.md" ] && summary=$(head -c 8000 "$RUNNER_TEMP/patch/summary.md")
-          body=$(printf 'Fix proposed by the auto-fix workflow: %s\n\n%s' "$PR_URL" "$summary")
-          call add_comment "$(jq -n --argjson id "$ISSUE_ID" --arg body "$body" '{issue_id: $id, body: $body}')" || true
-          # Fails on an issue without a release: Errilo cannot tell which release will contain the fix.
-          call update_issue "$(jq -n --argjson id "$ISSUE_ID" '{issue_id: $id, status: "resolved_in_next_release"}')" || true
+          step: pull-request
+          issue-id: ${{ needs.check.outputs.issue-id }}
+          errilo-token: ${{ secrets.ERRILO_TOKEN }}
+          errilo-org: ${{ vars.ERRILO_ORG }}
+          github-token: ${{ secrets.ERRILO_AUTOFIX_GITHUB_TOKEN || github.token }}
